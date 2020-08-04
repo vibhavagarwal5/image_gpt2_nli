@@ -115,7 +115,7 @@ def test_loop(model, tokenizer, dataloader, args):
         out_expl = tokenizer.decode(output[0, input_ids.shape[-1]:],
                                     skip_special_tokens=True)
         data_to_save.append([in_sent, expl, out_expl])
-        if idx % 400 == 0:
+        if idx % int(len(dataloader) / 40) == 0:
             print('MODEL_INPUT: ', in_sent)
             print('GROUND_EXPL: ', expl)
             print('GEN_EXPL: ', out_expl)
@@ -143,18 +143,18 @@ def bleu_prediction(generated_file):
 
 if __name__ == "__main__":
     args = get_args()
-    if 'e-SNLI-VE' in args.data_path:
-        args.no_image = False
-    else:
+    if 'eSNLI' in args.data_path:
         args.no_image = True
     if not args.no_image:
         args.no_premise = True
 
-    logger.info(f"Arguments: {pformat(args)}")
-
     logging.basicConfig(level=logging.INFO,
                         format='%(asctime)s %(levelname)s: %(message)s')
+    logger.info(f"Arguments: {pformat(args)}")
     logging.info('Loading model params from ' + args.model_checkpoint)
+    logger.info(f'Image not used:{args.no_image}')
+    logger.info(f'Premise not used:{args.no_premise}')
+    logger.info(f'Explanations used:{args.with_expl}')
 
     tokenizer = GPT2Tokenizer.from_pretrained(args.model_checkpoint_dir)
     tokenizer.add_special_tokens(SPECIAL_TOKENS_DICT)

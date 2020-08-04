@@ -101,9 +101,7 @@ def get_args():
 
 def main():
     args = get_args()
-    if 'e-SNLI-VE' in args.data_path:
-        args.no_image = False
-    else:
+    if 'eSNLI' in args.data_path:
         args.no_image = True
     if not args.no_image:
         args.no_premise = True
