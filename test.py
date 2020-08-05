@@ -28,6 +28,7 @@ def get_args():
     parser.add_argument("--data_path", type=str,
                         default="/home/hdd1/vibhav/VE-SNLI/mycode-vesnli/dataset/e-SNLI-VE")
     parser.add_argument("--data_type", type=str, default="dev")
+    parser.add_argument("--save_file", type=str, default="generated.csv")
 
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available()
                         else "cpu", help="Device (cuda or cpu)")
@@ -37,10 +38,10 @@ def get_args():
                         help="To process premise or not")
     parser.add_argument("--with_expl", action="store_true",
                         help="To use explanations or not")
+    parser.add_argument("--classify", action="store_true",
+                        help="To e labels as well for classification head")
     parser.add_argument("--small_data", type=int,
                         default=-1, help='small data size')
-
-    parser.add_argument("--save_file", type=str, default="generated.csv")
 
     parser.add_argument("--do_sample", action='store_true',
                         help="Set to use greedy decoding instead of sampling")
@@ -142,6 +143,7 @@ def bleu_prediction(generated_file):
 
 
 if __name__ == "__main__":
+    set_seed(42)
     args = get_args()
     if 'eSNLI' in args.data_path:
         args.no_image = True
@@ -160,10 +162,16 @@ if __name__ == "__main__":
     tokenizer.add_special_tokens(SPECIAL_TOKENS_DICT)
     model_config = GPT2Config.from_pretrained(args.model_checkpoint_dir)
     if args.no_image:
-        model = GPT2LMHeadModel(model_config)
+        if args.classify:
+            model = GPT2DoubleHeadsModel(model_config)
+        else:
+            model = GPT2LMHeadModel(model_config)
     else:
         import image_gpt2_291
-        model = image_gpt2_291.GPT2LMHeadModel(model_config)
+        if args.classify:
+            model = image_gpt2_291.GPT2DoubleHeadsModel(model_config)
+        else:
+            model = image_gpt2_291.GPT2LMHeadModel(model_config)
     model.load_state_dict(torch.load(os.path.join(args.model_checkpoint_dir,
                                                   args.model_checkpoint)))
     model.to(args.device)

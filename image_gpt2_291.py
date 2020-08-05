@@ -422,3 +422,67 @@ class GPT2LMHeadModel(GPT2PreTrainedModel):
 
         # (loss), lm_logits, presents, (all hidden_states), (attentions)
         return outputs
+
+
+class GPT2DoubleHeadsModel(GPT2PreTrainedModel):
+    def __init__(self, config):
+        super().__init__(config)
+        config.num_labels = 1
+        self.transformer = GPT2Model(config)
+        self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
+        self.multiple_choice_head = SequenceSummary(config)
+
+        self.init_weights()
+
+    def get_output_embeddings(self):
+        return self.lm_head
+
+    def forward(
+        self,
+        input_ids=None,
+        images=None,
+        past=None,
+        attention_mask=None,
+        token_type_ids=None,
+        position_ids=None,
+        head_mask=None,
+        inputs_embeds=None,
+        mc_token_ids=None,
+        labels=None,
+        mc_labels=None,
+        use_cache=None,
+    ):
+        transformer_outputs = self.transformer(
+            input_ids,
+            images=images,
+            past=past,
+            attention_mask=attention_mask,
+            token_type_ids=token_type_ids,
+            position_ids=position_ids,
+            head_mask=head_mask,
+            inputs_embeds=inputs_embeds,
+            use_cache=use_cache,
+        )
+
+        hidden_states = transformer_outputs[0]
+
+        lm_logits = self.lm_head(hidden_states)
+        mc_logits = self.multiple_choice_head(
+            hidden_states, mc_token_ids).squeeze(-1)
+
+        outputs = (lm_logits, mc_logits) + transformer_outputs[1:]
+        if mc_labels is not None:
+            loss_fct = CrossEntropyLoss()
+            loss = loss_fct(
+                mc_logits.view(-1, mc_logits.size(-1)), mc_labels.view(-1))
+            outputs = (loss,) + outputs
+        if labels is not None:
+            shift_logits = lm_logits[..., :-1, :].contiguous()
+            shift_labels = labels[..., 1:].contiguous()
+            loss_fct = CrossEntropyLoss()
+            loss = loss_fct(
+                shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
+            outputs = (loss,) + outputs
+
+        # (lm loss), (mc loss), lm logits, mc logits, presents, (all hidden_states), (attentions)
+        return outputs

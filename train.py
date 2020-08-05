@@ -64,14 +64,21 @@ def get_args():
     parser = ArgumentParser()
     parser.add_argument("--data_path", type=str,
                         default="/home/hdd1/vibhav/VE-SNLI/mycode-vesnli/dataset/e-SNLI-VE", help="Path of the dataset")
+    parser.add_argument("--model_checkpoint", type=str,
+                        default="gpt2", help="Path, url or short name of the model")
+    parser.add_argument("--output_folder", type=str,
+                        default='./output', help="output storage path")
     parser.add_argument("--no_image", action="store_true",
                         help="To process image or not")
     parser.add_argument("--no_premise", action="store_true",
                         help="To process premise or not")
     parser.add_argument("--with_expl", action="store_true",
                         help="To use explanations or not")
-    parser.add_argument("--model_checkpoint", type=str,
-                        default="gpt2", help="Path, url or short name of the model")
+    parser.add_argument("--classify", action="store_true",
+                        help="To e labels as well for classification head")
+
+    parser.add_argument("--small_data", type=int,
+                        default=-1, help='small data size')
     parser.add_argument("--batch_size", type=int,
                         default=4, help="Batch size for training")
     parser.add_argument("--gradient_accumulation_steps", type=int,
@@ -86,20 +93,18 @@ def get_args():
                         help="Linear warmup over warmup_steps.")
     parser.add_argument("--eval_before_start", action='store_true',
                         help="If true start with a first evaluation before training")
+
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available()
                         else "cpu", help="Device (cuda or cpu)")
     parser.add_argument("--fp16", type=str, default="",
                         help="Set to O0, O1, O2, O3 for fp16 training (see apex documentation)")
     parser.add_argument("--local_rank", type=int, default=-1,
                         help="Local rank for distributed training (-1: not distributed)")
-    parser.add_argument("--output_folder", type=str,
-                        default='./output', help="output storage path")
-    parser.add_argument("--small_data", type=int,
-                        default=-1, help='small data size')
     return parser.parse_args()
 
 
 def main():
+    set_seed(42)
     args = get_args()
     if 'eSNLI' in args.data_path:
         args.no_image = True
@@ -138,11 +143,18 @@ def main():
     tokenizer = GPT2Tokenizer.from_pretrained(args.model_checkpoint)
     tokenizer.add_special_tokens(SPECIAL_TOKENS_DICT)
     if args.no_image:
-        model = GPT2LMHeadModel.from_pretrained(args.model_checkpoint)
+        if args.classify:
+            model = GPT2DoubleHeadsModel.from_pretrained(args.model_checkpoint)
+        else:
+            model = GPT2LMHeadModel.from_pretrained(args.model_checkpoint)
     else:
         import image_gpt2_291
-        model = image_gpt2_291.GPT2LMHeadModel.from_pretrained(
-            args.model_checkpoint)
+        if args.classify:
+            model = image_gpt2_291.GPT2DoubleHeadsModel.from_pretrained(
+                args.model_checkpoint)
+        else:
+            model = image_gpt2_291.GPT2LMHeadModel.from_pretrained(
+                args.model_checkpoint)
     model.resize_token_embeddings(len(tokenizer))
     model.to(args.device)
     optimizer = AdamW(model.parameters(), lr=args.lr)
@@ -168,23 +180,50 @@ def main():
     def train(engine, batch):
         model.train()
         batch = tuple(input_tensor.to(args.device) for input_tensor in batch)
-        if args.no_image:
-            input_ids, lm_label, label, input_mask = batch
-        else:
-            image, input_ids, lm_label, label, input_mask = batch
 
         if args.no_image:
-            output = model(input_ids=input_ids,
-                           #    attention_mask=input_mask,
-                           labels=lm_label)
+            if args.classify:
+                input_ids, lm_label, label, mc_token_ids, input_mask = batch
+                model_input = {
+                    'input_ids': input_ids,
+                    'labels': lm_label,
+                    'mc_token_ids': mc_token_ids,
+                    'mc_labels': label,
+                    #    'attention_mask':input_mask,
+                }
+            else:
+                input_ids, lm_label, label, input_mask = batch
+                model_input = {
+                    'input_ids': input_ids,
+                    'labels': lm_label
+                }
         else:
-            output = model(input_ids=input_ids,
-                           images=image,
-                           #    attention_mask=input_mask,
-                           labels=lm_label)
-        loss, logits, _ = output
+            if args.classify:
+                image, input_ids, lm_label, label, mc_token_ids, input_mask = batch
+                model_input = {
+                    'input_ids': input_ids,
+                    'images': image,
+                    'labels': lm_label,
+                    'mc_token_ids': mc_token_ids,
+                    'mc_labels': label,
+                }
+            else:
+                image, input_ids, lm_label, label, input_mask = batch
+                model_input = {
+                    'input_ids': input_ids,
+                    'images': image,
+                    'labels': lm_label
+                }
+        for k in model_input.keys():
+            print(k, model_input[k].shape)
+        output = model(**model_input)
+        if args.classify:
+            loss, mc_loss, logits, mc_logits, _ = output
+            loss = (loss + mc_loss) / args.gradient_accumulation_steps
+        else:
+            loss, logits, _ = output
+            loss = loss / args.gradient_accumulation_steps
 
-        loss = loss / args.gradient_accumulation_steps
         if args.fp16:
             with amp.scale_loss(loss, optimizer) as scaled_loss:
                 scaled_loss.backward()
@@ -196,8 +235,8 @@ def main():
         if engine.state.iteration % args.gradient_accumulation_steps == 0:
             optimizer.step()
             optimizer.zero_grad()
-        if not args.with_expl:
-            lbl_accuracy = torch.eq(label, logits.argmax(
+        if args.classify:
+            lbl_accuracy = torch.eq(label, mc_logits.argmax(
                 dim=1)).float().sum() / len(label)
             return {
                 'loss': loss.item(),
@@ -225,26 +264,49 @@ def main():
         with torch.no_grad():
             batch = tuple(input_tensor.to(args.device)
                           for input_tensor in batch)
-            if args.no_image:
-                input_ids, lm_label, label, input_mask = batch
-            else:
-                image, input_ids, lm_label, label, input_mask = batch
 
             if args.no_image:
-                output = model(input_ids=input_ids,
-                               #    attention_mask=input_mask
-                               )
+                if args.classify:
+                    input_ids, lm_label, label, mc_token_ids, input_mask = batch
+                    model_input = {
+                        'input_ids': input_ids,
+                        'mc_token_ids': mc_token_ids,
+                        #    'attention_mask':input_mask,
+                    }
+                else:
+                    input_ids, lm_label, label, input_mask = batch
+                    model_input = {
+                        'input_ids': input_ids,
+                    }
             else:
-                output = model(input_ids=input_ids,
-                               images=image,
-                               #    attention_mask=input_mask
-                               )
-            logits, _ = output
+                if args.classify:
+                    image, input_ids, lm_label, label, mc_token_ids, input_mask = batch
+                    model_input = {
+                        'input_ids': input_ids,
+                        'images': image,
+                        'mc_token_ids': mc_token_ids,
+                    }
+                else:
+                    image, input_ids, lm_label, label, input_mask = batch
+                    model_input = {
+                        'input_ids': input_ids,
+                        'images': image,
+                    }
+            output = model(**model_input)
+            if args.classify:
+                logits, mc_logits, _ = output
+            else:
+                logits, _ = output
 
             logits_shifted = logits[..., :-1, :].contiguous().view(-1,
                                                                    logits.size(-1))
             labels_shifted = lm_label[..., 1:].contiguous().view(-1)
-            return logits_shifted, labels_shifted
+            out = (logits_shifted, labels_shifted,)
+            if args.classify:
+                mc_logits_shifted = mc_logits.view(-1, mc_logits.size(-1))
+                mc_labels_shifted = label.view(-1)
+                out = out + (mc_logits_shifted, mc_labels_shifted,)
+            return out
 
     '''Engines'''
     trainer = Engine(train)
@@ -273,7 +335,7 @@ def main():
         trainer, "loss")
     RunningAverage(output_transform=lambda x: math.exp(
         average_distributed_scalar(x['loss'], args))).attach(trainer, "ppl")
-    if not args.with_expl:
+    if args.classify:
         RunningAverage(output_transform=lambda x: 100 * x['lbl_accuracy']).attach(
             trainer, "lbl_accuracy")
 
@@ -284,9 +346,9 @@ def main():
         lambda l, a: average_distributed_scalar(
             l / a.gradient_accumulation_steps, a), metrics["lbl_loss"], args)
     metrics["ppl"] = MetricsLambda(math.exp, metrics["loss"])
-    if not args.with_expl:
+    if args.classify:
         metrics["lbl_accuracy"] = 100 * \
-            Accuracy(output_transform=lambda x: (x[0], x[1]))
+            Accuracy(output_transform=lambda x: (x[2], x[3]))
     for name, metric in metrics.items():
         metric.attach(validator, name)
 
@@ -296,7 +358,7 @@ def main():
     if args.local_rank in [-1, 0]:
         pbar = ProgressBar(persist=True)
         pbar.attach(trainer,
-                    metric_names=["loss", 'ppl'] if args.with_expl else ["loss", 'lbl_accuracy', 'ppl'])
+                    metric_names=["loss", 'ppl'] if not args.classify else ["loss", 'lbl_accuracy', 'ppl'])
         validator.add_event_handler(Events.COMPLETED,
                                     lambda _: pbar.log_message(
                                         "Validation: %s" % pformat(validator.state.metrics)))
@@ -313,14 +375,14 @@ def main():
         tb_logger.attach(trainer,
                          log_handler=OutputHandler(
                              tag="training",
-                             metric_names=["ppl"] if args.with_expl else ["lbl_accuracy", "ppl"]),
+                             metric_names=["ppl"] if not args.classify else ["lbl_accuracy", "ppl"]),
                          event_name=Events.EPOCH_COMPLETED)
 
         tb_logger.attach(validator,
                          log_handler=OutputHandler(
                              tag="validation",
-                             metric_names=[
-                                 'ppl', 'loss'] if args.with_expl else['ppl', 'loss', 'lbl_accuracy'],
+                             metric_names=['ppl', 'loss'] if not args.classify else [
+                                 'ppl', 'loss', 'lbl_accuracy'],
                              global_step_transform=lambda *args, **kwargs: trainer.state.iteration),
                          event_name=Events.EPOCH_COMPLETED)
 
