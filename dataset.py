@@ -10,14 +10,19 @@ import torch
 import torch.utils.data
 from torch.utils.data import Dataset
 
-LABEL_TOKENS_DICT = {
+LABEL2ID = {
     'contradiction': 0,
     'neutral': 1,
     'entailment': 2
 }
+ID2LABEL = {
+    0: 'contradiction',
+    1: 'neutral',
+    2: 'entailment'
+}
 SPECIAL_TOKENS_DICT = {
     'eos_token': '<eos>',
-    'cls_token': '<cls>',
+    # 'cls_token': '<cls>',
     'additional_special_tokens': ['<premise>', '<hypothesis>', '<expl>']
 }
 
@@ -29,7 +34,7 @@ def get_data(data_type, args):
     data['label'] = [line.rstrip() for line in open(
         os.path.join(args.data_path, f"labels.{data_type}"), 'r')]
     data['label_int'] = [
-        LABEL_TOKENS_DICT[i] for i in data['label']]
+        LABEL2ID[i] for i in data['label']]
     data['hypothesis'] = [line.rstrip() for line in open(
         os.path.join(args.data_path, f"s2.{data_type}"), 'r')]
     if args.no_image:
@@ -71,8 +76,8 @@ class InferenceDataset(Dataset):
         expl_ids = self.tokenizer.encode(expl)
         if self.args.with_expl:
             input_ids = input_ids + expl_ids
-        if self.args.classify:
-            input_ids = [self.tokenizer.cls_token_id] + input_ids
+        # if self.args.classify and self.args.with_expl:
+        #     input_ids = input_ids + [self.tokenizer.cls_token_id]
         input_ids = torch.tensor(input_ids).long()
         output = (input_ids,)
         if self.args.no_image:
@@ -90,9 +95,8 @@ class InferenceDataset(Dataset):
             image = self.all_images_np[self.all_image_names.index(
                 self.data['image_f'][index])]
             output = output + (image,)
-        if self.args.classify:
-            cls_token_location = 0
-            # cls_token_location = input_ids.index(tokenizer.cls_token_id)
+        if self.args.classify and self.args.with_expl:
+            cls_token_location = len(input_ids) - 1
             if not self.args.no_image:
                 cls_token_location += 36
             mc_token_ids = torch.tensor([cls_token_location]).long()
@@ -110,7 +114,7 @@ def collate_fn(batch, pad_token, args, no_pad=False):
     input_ids, lm_label, label = [], [], []
     if not args.no_image:
         image = []
-    if args.classify:
+    if args.classify and args.with_expl:
         mc_token_ids = []
     for i in batch:
         input_ids.append(i[0])
@@ -118,10 +122,10 @@ def collate_fn(batch, pad_token, args, no_pad=False):
         label.append(i[2])
         if not args.no_image:
             image.append(i[3])
-            if args.classify:
+            if args.classify and args.with_expl:
                 mc_token_ids.append(i[4])
         else:
-            if args.classify:
+            if args.classify and args.with_expl:
                 mc_token_ids.append(i[3])
 
     max_len_inp_ids = max(len(s) for s in input_ids)
@@ -131,7 +135,7 @@ def collate_fn(batch, pad_token, args, no_pad=False):
 
     label = torch.tensor(label).long()
     output = (input_ids, lm_label, label)
-    if args.classify:
+    if args.classify and args.with_expl:
         mc_token_ids = torch.tensor(mc_token_ids).long()
         output = output + (mc_token_ids,)
     if not args.no_image:
@@ -182,16 +186,16 @@ if __name__ == "__main__":
     dataset = InferenceDataset(args.data_type, tokenizer, args)
     dataloader = DataLoader(dataset,
                             batch_size=args.batch_size,
-                            collate_fn=lambda x: collate_fn(x, tokenizer.eos_token_id, args))
+                            collate_fn=lambda x: collate_fn(x, tokenizer.pad_token_id, args))
 
     batch = next(iter(dataloader))
     if args.no_image:
-        if args.classify:
+        if args.classify and args.with_expl:
             input_ids, lm_label, label, mc_token_ids, input_mask = batch
         else:
             input_ids, lm_label, label, input_mask = batch
     else:
-        if args.classify:
+        if args.classify and args.with_expl:
             image, input_ids, lm_label, label, mc_token_ids, input_mask = batch
         else:
             image, input_ids, lm_label, label, input_mask = batch
@@ -204,5 +208,5 @@ if __name__ == "__main__":
     print('lm_label', tokenizer.convert_ids_to_tokens(lm_label[0]))
     print('input_mask', input_mask[0])
     print('label', label)
-    if args.classify:
+    if args.classify and args.with_expl:
         print('mc_token_ids', mc_token_ids)
