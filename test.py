@@ -16,7 +16,7 @@ from torch.utils.data import DataLoader, Subset
 from tqdm import tqdm
 from transformers import *
 
-from dataset import SPECIAL_TOKENS_DICT, InferenceDataset, collate_fn, get_data
+from dataset import SPECIAL_TOKENS_DICT, InferenceDataset, collate_fn, get_data, ID2LABEL
 
 
 def get_args():
@@ -28,7 +28,9 @@ def get_args():
     parser.add_argument("--data_path", type=str,
                         default="/home/hdd1/vibhav/VE-SNLI/mycode-vesnli/dataset/e-SNLI-VE")
     parser.add_argument("--data_type", type=str, default="dev")
-    parser.add_argument("--save_file", type=str, default="generated.csv")
+    parser.add_argument("--save_file_prefix", type=str,
+                        default="generated")
+    parser.add_argument("--save_output", action="store_true")
 
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available()
                         else "cpu", help="Device (cuda or cpu)")
@@ -82,7 +84,8 @@ def sample_sequence(model, length, context, eos_token_id=None):
 
 
 def test_loop(model, tokenizer, dataloader, args):
-    save_point = os.path.join(args.model_checkpoint_dir, args.save_file)
+    save_point = os.path.join(args.model_checkpoint_dir,
+                              f"{args.save_file_prefix}_{args.data_type}.csv")
     data_to_save = []
     for idx, batch in enumerate(tqdm(dataloader)):
         batch = tuple(input_tensor.to(args.device) for input_tensor in batch)
@@ -90,6 +93,7 @@ def test_loop(model, tokenizer, dataloader, args):
             input_ids, lm_label, label, input_mask = batch
         else:
             image, input_ids, lm_label, label, input_mask = batch
+
         if args.no_image:
             output = model.generate(
                 input_ids,
@@ -115,17 +119,53 @@ def test_loop(model, tokenizer, dataloader, args):
                                 skip_special_tokens=True)
         out_expl = tokenizer.decode(output[0, input_ids.shape[-1]:],
                                     skip_special_tokens=True)
-        data_to_save.append([in_sent, expl, out_expl])
-        if idx % int(len(dataloader) / 40) == 0:
+        if args.classify:
+            output = list(filter(lambda x: x != tokenizer.eos_token_id,
+                                 output[0].tolist())) + [tokenizer.eos_token_id]
+            output = torch.tensor([output]).long().to(args.device)
+            mc_token_ids = torch.tensor(
+                [len(output[0]) - 1]).long().to(args.device)
+            if args.no_image:
+                logits, mc_logits = model(
+                    input_ids=output,
+                    mc_token_ids=mc_token_ids
+                )
+            else:
+                logits, mc_logits = model(
+                    input_ids=output,
+                    images=image,
+                    mc_token_ids=mc_token_ids
+                )
+            grnd_label = ID2LABEL[label[0].item()]
+            gen_label = ID2LABEL[mc_logits.argmax(dim=1)[0].item()]
+
+        to_save = [in_sent, expl, out_expl]
+        columns = ['model_input', 'expl', 'gen_expl']
+        if args.classify:
+            to_save += [grnd_label, gen_label]
+            columns += ['grnd_label', 'gen_label']
+        data_to_save.append(to_save)
+
+        if idx % int(len(dataloader) / 50) == 0:
             print('MODEL_INPUT: ', in_sent)
             print('GROUND_EXPL: ', expl)
             print('GEN_EXPL: ', out_expl)
+            if args.classify:
+                print('GROUND_LBL: ', grnd_label)
+                print('GEN_LBL: ', gen_label)
             print('--------------------------------')
-            pd.DataFrame(data_to_save, columns=['model_input', 'expl', 'gen_expl']).to_csv(
-                save_point, sep='\t', index=None)
-    pd.DataFrame(data_to_save, columns=['model_input', 'expl', 'gen_expl']).to_csv(
-        save_point, sep='\t', index=None)
+            if args.save_output:
+                pd.DataFrame(data_to_save, columns=columns).to_csv(
+                    save_point, sep='\t', index=None)
+    if args.save_output:
+        pd.DataFrame(data_to_save, columns=columns).to_csv(
+            save_point, sep='\t', index=None)
     bleu_prediction(save_point)
+    if args.classify:
+        df = pd.read_csv(save_point, sep='\t')
+        lbl_accuracy = df[df['grnd_label'] ==
+                          df['gen_label']].shape[0] / df.shape[0]
+        print('Label Accuracy:', lbl_accuracy)
 
 
 def bleu_prediction(generated_file):
@@ -163,13 +203,16 @@ if __name__ == "__main__":
     model_config = GPT2Config.from_pretrained(args.model_checkpoint_dir)
     if args.no_image:
         if args.classify:
-            model = GPT2DoubleHeadsModel(model_config)
+            import org_gpt2_291
+            model = org_gpt2_291.GPT2DoubleHeadsModel(model_config)
+            args.beam_size = 1
         else:
             model = GPT2LMHeadModel(model_config)
     else:
         import image_gpt2_291
         if args.classify:
             model = image_gpt2_291.GPT2DoubleHeadsModel(model_config)
+            args.beam_size = 1
         else:
             model = image_gpt2_291.GPT2LMHeadModel(model_config)
     model.load_state_dict(torch.load(os.path.join(args.model_checkpoint_dir,
@@ -185,6 +228,6 @@ if __name__ == "__main__":
     dataloader = DataLoader(dataset,
                             batch_size=1,
                             num_workers=8,
-                            collate_fn=lambda x: collate_fn(x, tokenizer.eos_token_id, args))
+                            collate_fn=lambda x: collate_fn(x, -100, args))
 
     test_loop(model, tokenizer, dataloader, args)

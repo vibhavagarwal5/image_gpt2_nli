@@ -144,7 +144,9 @@ def main():
     tokenizer.add_special_tokens(SPECIAL_TOKENS_DICT)
     if args.no_image:
         if args.classify:
-            model = GPT2DoubleHeadsModel.from_pretrained(args.model_checkpoint)
+            import org_gpt2_291
+            model = org_gpt2_291.GPT2DoubleHeadsModel.from_pretrained(
+                args.model_checkpoint)
         else:
             model = GPT2LMHeadModel.from_pretrained(args.model_checkpoint)
     else:
@@ -214,16 +216,14 @@ def main():
                     'images': image,
                     'labels': lm_label
                 }
-        for k in model_input.keys():
-            print(k, model_input[k].shape)
         output = model(**model_input)
         if args.classify:
-            loss, mc_loss, logits, mc_logits, _ = output
-            loss = (loss + mc_loss) / args.gradient_accumulation_steps
+            loss, mc_loss, logits, mc_logits = output
+            loss = (loss + 2 * mc_loss) / 3
         else:
             loss, logits, _ = output
-            loss = loss / args.gradient_accumulation_steps
 
+        loss = loss / args.gradient_accumulation_steps
         if args.fp16:
             with amp.scale_loss(loss, optimizer) as scaled_loss:
                 scaled_loss.backward()
@@ -238,6 +238,19 @@ def main():
         if args.classify:
             lbl_accuracy = torch.eq(label, mc_logits.argmax(
                 dim=1)).float().sum() / len(label)
+            if engine.state.iteration % (args.gradient_accumulation_steps * 500) == 0:
+                input_output = list(zip(input_ids, logits, label, mc_logits))
+                random_item = random.choice(input_output)
+                in_sent = tokenizer.decode(list(filter(
+                    lambda x: x != tokenizer.eos_token_id,
+                    random_item[0])))
+                out_expl = tokenizer.decode(random_item[1].argmax(dim=1),
+                                            skip_special_tokens=True)
+                logger.info(f'MODEL INPUT: {in_sent}')
+                logger.info(f'GEN. EXPL: {out_expl}')
+                logger.info(f'LABEL: {random_item[2]}')
+                logger.info(f'GEN. LABEL: {random_item[3].argmax(dim=0)}')
+                logger.info('--------------------------------')
             return {
                 'loss': loss.item(),
                 'lbl_accuracy': lbl_accuracy.item()
@@ -252,7 +265,7 @@ def main():
                 out_expl = tokenizer.decode(random_item[1].argmax(dim=1),
                                             skip_special_tokens=True)
                 logger.info(f'MODEL INPUT: {in_sent}')
-                logger.info(f'GEN. EXPL {out_expl}')
+                logger.info(f'GEN. EXPL: {out_expl}')
                 logger.info('--------------------------------')
             return {
                 'loss': loss.item(),
@@ -294,7 +307,7 @@ def main():
                     }
             output = model(**model_input)
             if args.classify:
-                logits, mc_logits, _ = output
+                logits, mc_logits = output
             else:
                 logits, _ = output
 
@@ -336,19 +349,24 @@ def main():
     RunningAverage(output_transform=lambda x: math.exp(
         average_distributed_scalar(x['loss'], args))).attach(trainer, "ppl")
     if args.classify:
-        RunningAverage(output_transform=lambda x: 100 * x['lbl_accuracy']).attach(
+        RunningAverage(output_transform=lambda x: x['lbl_accuracy']).attach(
             trainer, "lbl_accuracy")
 
     metrics = {}
-    metrics["lbl_loss"] = Loss(torch.nn.CrossEntropyLoss(),
-                               output_transform=lambda x: (x[0], x[1]))
-    metrics["loss"] = MetricsLambda(
-        lambda l, a: average_distributed_scalar(
-            l / a.gradient_accumulation_steps, a), metrics["lbl_loss"], args)
-    metrics["ppl"] = MetricsLambda(math.exp, metrics["loss"])
+    metrics["expl_loss"] = Loss(torch.nn.CrossEntropyLoss(),
+                                output_transform=lambda x: (x[0], x[1]))
     if args.classify:
-        metrics["lbl_accuracy"] = 100 * \
-            Accuracy(output_transform=lambda x: (x[2], x[3]))
+        metrics["lbl_loss"] = Loss(torch.nn.CrossEntropyLoss(),
+                                   output_transform=lambda x: (x[2], x[3]))
+        metrics["loss"] = MetricsLambda(lambda e, l, a: average_distributed_scalar(
+            ((2 * l + e) / 3) / a.gradient_accumulation_steps, a),
+            metrics["expl_loss"], metrics["lbl_loss"], args)
+        metrics["lbl_accuracy"] = Accuracy(
+            output_transform=lambda x: (x[2], x[3]))
+    else:
+        metrics["loss"] = MetricsLambda(lambda l, a: average_distributed_scalar(
+            l / a.gradient_accumulation_steps, a), metrics["expl_loss"], args)
+    metrics["ppl"] = MetricsLambda(math.exp, metrics["loss"])
     for name, metric in metrics.items():
         metric.attach(validator, name)
 
