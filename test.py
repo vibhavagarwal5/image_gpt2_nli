@@ -90,9 +90,34 @@ def test_loop(model, tokenizer, dataloader, args):
     for idx, batch in enumerate(tqdm(dataloader)):
         batch = tuple(input_tensor.to(args.device) for input_tensor in batch)
         if args.no_image:
-            input_ids, lm_label, label, input_mask = batch
+            if args.classify:
+                input_ids, lm_label, label, mc_token_ids, input_mask = batch
+            else:
+                input_ids, lm_label, label, input_mask = batch
         else:
-            image, input_ids, lm_label, label, input_mask = batch
+            if args.classify:
+                image, input_ids, lm_label, label, mc_token_ids, input_mask = batch
+            else:
+                image, input_ids, lm_label, label, input_mask = batch
+
+        if args.classify:
+            if args.no_image:
+                logits, mc_logits = model(
+                    input_ids=input_ids,
+                    mc_token_ids=mc_token_ids
+                )
+            else:
+                logits, mc_logits = model(
+                    input_ids=input_ids,
+                    images=image,
+                    mc_token_ids=mc_token_ids
+                )
+            grnd_label = ID2LABEL[label[0].item()]
+            gen_label = ID2LABEL[mc_logits.argmax(dim=1)[0].item()]
+            input_ids = input_ids[0].tolist() + tokenizer.encode(
+                gen_label,
+                [SPECIAL_TOKENS_DICT['additional_special_tokens'][2]])
+            input_ids = torch.tensor([input_ids]).long().to(args.device)
 
         if args.no_image:
             output = model.generate(
@@ -119,25 +144,6 @@ def test_loop(model, tokenizer, dataloader, args):
                                 skip_special_tokens=True)
         out_expl = tokenizer.decode(output[0, input_ids.shape[-1]:],
                                     skip_special_tokens=True)
-        if args.classify:
-            output = list(filter(lambda x: x != tokenizer.eos_token_id,
-                                 output[0].tolist())) + [tokenizer.eos_token_id]
-            output = torch.tensor([output]).long().to(args.device)
-            mc_token_ids = torch.tensor(
-                [len(output[0]) - 1]).long().to(args.device)
-            if args.no_image:
-                logits, mc_logits = model(
-                    input_ids=output,
-                    mc_token_ids=mc_token_ids
-                )
-            else:
-                logits, mc_logits = model(
-                    input_ids=output,
-                    images=image,
-                    mc_token_ids=mc_token_ids
-                )
-            grnd_label = ID2LABEL[label[0].item()]
-            gen_label = ID2LABEL[mc_logits.argmax(dim=1)[0].item()]
 
         to_save = [in_sent, expl, out_expl]
         columns = ['model_input', 'expl', 'gen_expl']
